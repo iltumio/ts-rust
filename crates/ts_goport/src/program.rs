@@ -524,6 +524,8 @@ impl EmitPool {
         self.pool.broadcast(|_| {
             free_synthetic_nodes();
             drop(TABLES.with(|cache| cache.borrow_mut().take()));
+            go_frontend::install_lazy_jsdoc_seed(Default::default());
+            crate::core::set_thread_program(None);
         });
     }
 }
@@ -2479,7 +2481,7 @@ fn bind_files_parallel(lineage: &mut Lineage) {
     };
     let (sender, receiver) = std::sync::mpsc::channel::<ParallelBind>();
     #[cfg(not(target_family = "wasm"))]
-    let complete = bind_rayon_pool().in_place_scope(|scope| {
+    let complete = bind_rayon_pool(threads).in_place_scope(|scope| {
         // PERF (bindonce1): a seed copies the synthetic nodes of this thread,
         // 0.13 to 1.9 ms each on TypeORM, so 16 seeds took 3.9 ms of this
         // thread before it built the lazy state below. This thread now takes
@@ -2686,6 +2688,13 @@ impl Drop for LinkBinders<'_> {
             drop(state);
             self.queue.changed.notify_all();
         }
+        // Release thread-local state installed by `WorkerSeed::install` so
+        // reusable Rayon bind worker threads do not retain synthetic arenas,
+        // lazy JSDoc clones, or program tables after the bind scope ends.
+        drop(TABLES.with(|cache| cache.borrow_mut().take()));
+        free_synthetic_nodes();
+        go_frontend::install_lazy_jsdoc_seed(Default::default());
+        crate::core::set_thread_program(None);
         #[cfg(test)]
         if let Some(on_drop) = self.on_drop.take() {
             on_drop();
@@ -2694,19 +2703,28 @@ impl Drop for LinkBinders<'_> {
 }
 
 /// Shared Rayon thread pool for parallel binding across the process, avoiding
-/// per-program OS thread creation/teardown overhead.
+/// per-program OS thread creation/teardown overhead while sizing the pool only
+/// to the required bind thread count (`min_threads`).
 #[cfg(not(target_family = "wasm"))]
-fn bind_rayon_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let count = available_cores().max(WIDE_CORES);
+fn bind_rayon_pool(min_threads: usize) -> Arc<rayon::ThreadPool> {
+    static POOL: Mutex<Option<Arc<rayon::ThreadPool>>> = Mutex::new(None);
+    let mut guard = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(pool) = guard.as_ref()
+        && pool.current_num_threads() >= min_threads
+    {
+        return Arc::clone(pool);
+    }
+    let count = min_threads.max(1);
+    let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(count)
             .thread_name(|index| format!("bind-{index}"))
             .stack_size(crate::gostd::stack::max_stack_size())
             .build()
-            .expect("failed to build rayon bind thread pool")
-    })
+            .expect("failed to build rayon bind thread pool"),
+    );
+    *guard = Some(Arc::clone(&pool));
+    pool
 }
 
 /// Starts bind task `f` in `scope` on the shared Rayon bind pool.
@@ -6418,7 +6436,7 @@ mod tests {
             };
             let (sender, _receiver) = std::sync::mpsc::channel();
             let chain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                bind_rayon_pool().in_place_scope(|scope| spawn_bind_chain(scope, threads, &run, &queue, sender));
+                bind_rayon_pool(threads).in_place_scope(|scope| spawn_bind_chain(scope, threads, &run, &queue, sender));
             }));
             let _ = done.send((
                 chain.is_err(),
@@ -6497,7 +6515,7 @@ mod tests {
             };
             let (sender, _receiver) = std::sync::mpsc::channel();
             let chain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                bind_rayon_pool().in_place_scope(|scope| spawn_bind_chain(scope, 2, &run, &queue, sender));
+                bind_rayon_pool(2).in_place_scope(|scope| spawn_bind_chain(scope, 2, &run, &queue, sender));
             }));
             let _ = done.send((
                 chain.is_err(),
